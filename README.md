@@ -3,7 +3,7 @@
 **wasb** is what happens when you get tired of your agents treating your instructions like optional lore.
 
 It keeps a SysML v2 model in `.wasb/` and demands the rest of the repo to explain itself.
-When the agents try to pretend like they didn't know not to delete your NetworkPolicies (for the hundredth time), the gates return structured diagnostics and refuse to let the loop continue.
+When the agents try to pretend like they didn't know not to delete your NetworkPolicies (for the hundredth time), the gates return structured diagnostics and refuse to let the agent move on.
 
 ## What it does
 
@@ -28,25 +28,23 @@ wasb init
 ## Usage (vibe)
 
 ```bash
-wasb init                        # once per machine: pi won't let an agent finish while wasb check fails
-wasb import                      # propose the model; nothing is authoritative yet
-wasb trust add ~/.ssh/id_ed25519.pub   # or a GPG key id
-wasb trust sign                  # uses git's gpg.format and user.signingkey
-git add .wasb && git commit -S   # sign it, or live in warning-only mode forever
+wasb import                             # propose the model; nothing is authoritative yet
+wasb trust add ~/.ssh/id_ed25519.pub    # or a GPG key id
+wasb trust sign                         # uses git's gpg.format and user.signingkey
+git add .wasb && git commit -S          # sign it
 
-wasb check                       # all gates; --json if you ask nicely
-wasb check drift                 # also: unmodeled, requirements, signature, coverage
-wasb generate --write            # Go stubs for functions the model has and the code doesn't
+wasb check                              # all gates; --json if you ask nicely
+wasb check drift                        # also: unmodeled, requirements, signature, coverage
+wasb generate --write                   # Go stubs for functions the model has and the code doesn't
 wasb propose tighten .wasb/model/user/requirements.sysml=proposed.sysml
-                                 # a suggestion nobody is allowed to merge without signing
+                                        # a suggestion nobody is allowed to merge without signing
 wasb propose reject tighten --reason "no"
 wasb status
 wasb coverage
-wasb mcp                         # the same operations as MCP tools, minus the teeth
+wasb mcp                                # the same operations as MCP tools, minus the teeth
 ```
 
 Trusted keys live in `.wasb/trust.yaml`.
-Any key of the previous version signs the next one, and version 1 must be signed by whoever signed the first commit touching `.wasb/`.
 Lost your key?
 A teammate runs `wasb trust add <your new key>` and `wasb trust sign`.
 
@@ -69,8 +67,4 @@ Specialization and redefinition handle overrides.
 ## Status
 
 We are so back.  
-
-## License
-
-AGPL-v3
 
