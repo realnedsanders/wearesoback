@@ -9,7 +9,7 @@ When the agents try to pretend like they didn't know not to delete your NetworkP
 
 - Import: write fanfic about your repo.
 - Drift gate: "forgot to update the 978 docs pages that reference this one line of code".
-- Unmodeled gate: "added a function / template / job / resource and pretended we wouldn't notice (we didn't)".
+- Unmodeled gate: "added a function / template / job / resource and pretended you wouldn't notice".
 - Requirements gate: "did the opposite of what you asked it to do 3 seconds ago".
 - Signature gate: "tried to larp as you approving itself".
 - Coverage metrics: shows the futility of your efforts in real time.
