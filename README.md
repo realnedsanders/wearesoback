@@ -38,17 +38,44 @@ go install github.com/realnedsanders/wearesoback/src/cmd/wasb@latest
 ## Usage (vibe)
 
 ```bash
-wasb import          # propose the model; nothing is authoritative yet
-# sign the commit or live in warning-only mode forever
+wasb import                      # propose the model; nothing is authoritative yet
+wasb trust add ~/.ssh/id_ed25519.pub   # or a GPG key id
+wasb trust sign                  # uses git's gpg.format and user.signingkey
+git add .wasb && git commit -S   # sign it, or live in warning-only mode forever
 
-wasb check           # all gates, JSON if you ask nicely
-wasb check drift
-wasb check unmodeled
-wasb propose         # agent (or you) writes a suggestion it is not allowed to merge
+wasb check                       # all gates; --json if you ask nicely
+wasb check drift                 # also: unmodeled, requirements, signature, coverage
+wasb generate --write            # Go stubs for functions the model has and the code doesn't
+wasb propose tighten .wasb/model/user/requirements.sysml=proposed.sysml
+                                 # a suggestion nobody is allowed to merge without signing
+wasb propose reject tighten --reason "no"
+wasb status
+wasb coverage
+wasb mcp                         # the same operations as MCP tools, minus the teeth
 ```
 
-The harness (a lightly modified pi) calls `wasb check` between turns.
-On failure it pastes the diagnostics back in and declines to continue.
+Requirements live in `.wasb/model/user/` and need an `@WASB::EvidenceClass`.
+Generated elements are typed by `WASB::UDSAllow`, `WASB::GoFunc` and friends, so a requirement can read their attributes:
+
+```sysml
+requirement def KeycloakEgress {
+    @UserDeclared;
+    @EvidenceClass { evidence = EvidenceClassKind::structural; }
+    subject rule : UDSAllow;
+    require constraint { rule.remoteNamespace == "keycloak" }
+}
+requirement keycloakEgress : KeycloakEgress { @UserDeclared; }
+satisfy keycloakEgress by Generated::'chart/templates/uds-package.yaml#Keycloak egress';
+```
+
+Trusted keys live in `.wasb/trust.yaml`.
+Any key of the previous version signs the next one, and version 1 must be signed by whoever signed the first commit touching `.wasb/`.
+Lost your key?
+A teammate runs `wasb trust add <your new key>` and `wasb trust sign`.
+
+The harness is a pi (>= 1.4) extension: `pi -e harness/pi/wasb-gate.ts`, or copy it to `~/.pi/agent/extensions/`.
+Set `WASB_BIN` to wasb's absolute path.
+Before the agent may stop, it runs `wasb check --json`; on failure it pastes the diagnostics back in and declines to stop.
 There is no “just this once".
 
 ## The bit
@@ -70,7 +97,6 @@ The signature gate still applies if you marked the result `UserDeclared`.
 ## Status
 
 We are so back.  
-(The coverage report will tell you how back.)
 
 ## License
 

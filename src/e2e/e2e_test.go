@@ -2,14 +2,17 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -78,19 +81,81 @@ components:
       - ghcr.io/example/demo:v1
 `
 	userReqs = `package UserRequirements {
-    requirement def KeepServer { @WASB::UserDeclared; }
+    private import WASB::*;
+    requirement def KeepServer {
+        @UserDeclared;
+        @EvidenceClass { evidence = EvidenceClassKind::structural; }
+    }
 }
 `
-	generated = ".wasb/model/generated/model.sysml"
+	chartYAML  = "apiVersion: v2\nname: demo\nversion: 0.1.0\n"
+	udsPackage = `apiVersion: uds.dev/v1alpha1
+kind: Package
+metadata:
+  name: demo
+  namespace: {{ .Release.Namespace }}
+spec:
+  network:
+    expose:
+      - service: demo
+        host: demo
+        gateway: tenant
+        port: 8080
+    allow:
+      - direction: Egress
+        remoteNamespace: keycloak
+        port: 8080
+        description: "Keycloak egress"
+      {{- if .Values.debug }}
+      - direction: Egress
+        remoteGenerated: Anywhere
+        description: "Debug egress"
+      {{- end }}
+`
+	tasksYAML = "tasks:\n  - name: build\n    description: Build it\n    actions:\n      - cmd: echo build\n"
+	workflow  = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+	// storyReqs is the user's: the Keycloak egress rule must stay pointed at keycloak.
+	storyReqs = `package UserRequirements {
+    private import WASB::*;
+    requirement def KeepServer {
+        @UserDeclared;
+        @EvidenceClass { evidence = EvidenceClassKind::structural; }
+    }
+    requirement def KeycloakEgress {
+        @UserDeclared;
+        @EvidenceClass { evidence = EvidenceClassKind::structural; }
+        subject rule : UDSAllow;
+        require constraint { rule.remoteNamespace == "keycloak" }
+    }
+    requirement keycloakEgress : KeycloakEgress { @UserDeclared; }
+    satisfy keycloakEgress by Generated::'chart/templates/uds-package.yaml#Keycloak egress';
+}
+`
+	missingFunc = `    action 'app#Missing' : WASB::GoFunc {
+        @WASB::Anchor { path = "app"; kind = "go.func"; id = "Missing"; }
+        :>> signature = "func Missing() error";
+    }
+`
+	generated = ".wasb/model/generated/import.sysml"
 	user      = ".wasb/model/user/requirements.sysml"
 )
 
 type result struct {
-	Pass        bool `json:"pass"`
+	Pass        bool   `json:"pass"`
+	Mode        string `json:"mode"`
 	Diagnostics []struct {
 		Gate, Element, Path, Message, Fix string
 		Line                              int
+		New                               bool
 	} `json:"diagnostics"`
+	Manifest struct {
+		KnownGaps        []struct{ Element, Reason string }       `json:"knownGaps"`
+		AwaitingEvidence []struct{ Requirement, Evidence string } `json:"awaitingEvidence"`
+		Files            []struct {
+			File             string
+			Targets, Modeled int
+		} `json:"files"`
+	} `json:"manifest"`
 }
 
 type env struct {
@@ -229,8 +294,12 @@ func pass(t *testing.T, r result) {
 	}
 }
 
+// fails finds a diagnostic and, when the model is authoritative, checks that it blocks.
 func fails(t *testing.T, r result, gate, msg string) {
 	t.Helper()
+	if r.Mode == "enforcing" && r.Pass {
+		t.Fatalf("want %s to block, got pass", gate)
+	}
 	for _, d := range r.Diagnostics {
 		if d.Gate == gate && strings.Contains(d.Message, msg) {
 			return
@@ -239,20 +308,64 @@ func fails(t *testing.T, r result, gate, msg string) {
 	t.Fatalf("want %s diagnostic containing %q, got %+v", gate, msg, r.Diagnostics)
 }
 
-// modeled writes the fixture and a model built from the unmodeled gate's own fixes.
-func modeled(t *testing.T) *env {
-	e := newEnv(t)
+// fixture writes the Go and zarf fixture and, with chart, a Helm chart with a
+// UDS Package CR, a tasks file and a workflow.
+func (e *env) fixture(chart bool) {
 	e.write("app/app.go", appGo)
 	e.write("app/app_test.go", appTestGo)
 	e.write("zarf.yaml", zarfYAML)
-	e.write(user, userReqs)
-	r := e.wasb("check", "unmodeled")
-	var fixes []string
-	for _, d := range r.Diagnostics {
-		fixes = append(fixes, "    "+d.Fix)
+	if chart {
+		e.write("chart/Chart.yaml", chartYAML)
+		e.write("chart/templates/uds-package.yaml", udsPackage)
+		e.write("chart/templates/_helpers.tpl", "{{- define \"demo.name\" -}}demo{{- end }}\n")
+		e.write("tasks.yaml", tasksYAML)
+		e.write(".github/workflows/ci.yaml", workflow)
 	}
-	e.write(generated, "package Generated {\n"+strings.Join(fixes, "\n")+"\n}\n")
+}
+
+// repo writes the fixture, imports it and writes the user's requirements.
+func repo(t *testing.T, chart bool, reqs string) *env {
+	e := newEnv(t)
+	e.fixture(chart)
+	e.cli("import")
+	e.write(user, reqs)
 	return e
+}
+
+func modeled(t *testing.T) *env { return repo(t, false, userReqs) }
+
+// sign trusts a new root key, signs the chain with it and commits everything signed.
+func sign(t *testing.T, e *env) string {
+	root := e.sshKey("root")
+	e.cli("trust", "add", root+".pub")
+	e.cli("trust", "sign", "--format", "ssh", "--key", root)
+	e.commit(root, "import")
+	r := e.wasb("check")
+	pass(t, r)
+	if r.Mode != "enforcing" {
+		t.Fatalf("want enforcing after a signed import, got %s", r.Mode)
+	}
+	return root
+}
+
+// fixDrift applies every drift fix the way an agent would: replace the named element.
+func (e *env) fixDrift() {
+	e.t.Helper()
+	for _, d := range e.wasb("check", "drift").Diagnostics {
+		_, element, ok := strings.Cut(d.Fix, "\n")
+		if !ok {
+			e.t.Fatalf("no element in fix %q", d.Fix)
+		}
+		s := e.read(generated)
+		head := "    " + element[:strings.Index(element, " : ")] + " : "
+		start := strings.Index(s, head)
+		end := start + strings.Index(s[start:], "\n    }\n") + len("\n    }\n")
+		e.write(generated, s[:start]+indent(element)+s[end:])
+	}
+}
+
+func indent(s string) string {
+	return "    " + strings.TrimSuffix(strings.ReplaceAll(s, "\n", "\n    "), "    ")
 }
 
 func TestUnmodeled(t *testing.T) {
@@ -290,17 +403,12 @@ func TestDrift(t *testing.T) {
 	t.Run("signature change needs the model", func(t *testing.T) {
 		e := modeled(t)
 		e.replace("app/app.go", "Run(addr string)", "Run(addr string, port int)")
-		r := e.wasb("check", "drift")
-		fails(t, r, "drift", "go.func Server.Run changed but the model did not")
-		var stale string
-		for _, el := range strings.Split(e.read(generated), "\n") {
-			if strings.Contains(el, `id = "Server.Run"`) {
-				stale = el[strings.Index(el, "lastHash = ")+len("lastHash = ") : strings.LastIndex(el, `";`)+1]
-			}
-		}
-		fix := r.Diagnostics[0].Fix
-		e.replace(generated, stale, fix[strings.Index(fix, "lastHash = ")+len("lastHash = "):])
+		fails(t, e.wasb("check", "drift"), "drift", "go.func Server.Run changed but the model did not")
+		e.fixDrift()
 		pass(t, e.wasb("check", "drift"))
+		if !strings.Contains(e.read(generated), `signature = "func (s *Server) Run(addr string, port int) error"`) {
+			t.Fatal("the fix did not record the new signature")
+		}
 	})
 
 	t.Run("zarf component change needs the model", func(t *testing.T) {
@@ -328,12 +436,7 @@ func TestDrift(t *testing.T) {
 // signed returns a modeled repo whose import commit and trust file are signed by root.
 func signed(t *testing.T) (e *env, root string) {
 	e = modeled(t)
-	root = e.sshKey("root")
-	e.cli("trust", "add", root+".pub")
-	e.cli("trust", "sign", "--format", "ssh", "--key", root)
-	e.commit(root, "import")
-	pass(t, e.wasb("check"))
-	return e, root
+	return e, sign(t, e)
 }
 
 func TestSignature(t *testing.T) {
@@ -507,15 +610,322 @@ func TestReferencePackage(t *testing.T) {
 
 	r := e.wasb("check", "unmodeled")
 	fails(t, r, "unmodeled", "zarf.component reference-package[upstream] is not modeled")
-	fails(t, r, "unmodeled", "zarf.component reference-package[unicorn] is not modeled")
-	var fixes []string
-	for _, d := range r.Diagnostics {
-		fixes = append(fixes, "    "+d.Fix)
-	}
-	e.write(generated, "package Generated {\n"+strings.Join(fixes, "\n")+"\n}\n")
+	fails(t, r, "unmodeled", "uds.allow Keycloak OIDC backend (operator only generates for Authservice clients) is not modeled")
+	fails(t, r, "unmodeled", "gha.job validate is not modeled")
+	e.cli("import")
 	pass(t, e.wasb("check", "unmodeled"))
 	pass(t, e.wasb("check", "drift"))
+	pass(t, e.wasb("check", "requirements"))
 
 	e.replace("zarf.yaml", "reference-package:v0.3.0", "reference-package:v0.4.0")
 	fails(t, e.wasb("check", "drift"), "drift", "zarf.component reference-package[upstream] changed")
+}
+
+func TestScanners(t *testing.T) {
+	e := newEnv(t)
+	e.fixture(true)
+	r := e.wasb("check", "unmodeled")
+	for _, want := range []string{
+		"helm.template uds-package.yaml is not modeled",
+		"helm.template _helpers.tpl is not modeled",
+		"uds.allow Keycloak egress is not modeled",
+		"uds.allow Debug egress is not modeled",
+		"uds.expose gateway=tenant host=demo port=8080 service=demo is not modeled",
+		"uds.task build is not modeled",
+		"gha.job test is not modeled",
+	} {
+		fails(t, r, "unmodeled", want)
+	}
+	e.cli("import")
+	pass(t, e.wasb("check", "unmodeled"))
+	pass(t, e.wasb("check", "drift"))
+	if !strings.Contains(e.read(generated), `:>> portNumber = 8080;`) || !strings.Contains(e.read(generated), `:>> runsOn = "ubuntu-latest";`) {
+		t.Fatal("import did not record the targets' attributes")
+	}
+
+	t.Run("template edit is drift", func(t *testing.T) {
+		e.replace("chart/templates/uds-package.yaml", "port: 8080\n        description: \"Keycloak egress\"", "port: 9090\n        description: \"Keycloak egress\"")
+		r := e.wasb("check", "drift")
+		fails(t, r, "drift", "helm.template uds-package.yaml changed")
+		fails(t, r, "drift", "uds.allow Keycloak egress changed")
+		e.fixDrift()
+		pass(t, e.wasb("check", "drift"))
+	})
+
+	t.Run("model attribute edit is drift", func(t *testing.T) {
+		e.replace(generated, `:>> remoteNamespace = "keycloak";`, `:>> remoteNamespace = "elsewhere";`)
+		fails(t, e.wasb("check", "drift"), "drift", `remoteNamespace is "keycloak", the model says "elsewhere"`)
+	})
+}
+
+func TestRequirements(t *testing.T) {
+	setup := func(t *testing.T) (*env, string) {
+		e := repo(t, true, storyReqs)
+		return e, sign(t, e)
+	}
+
+	t.Run("loosened rule fails and is new", func(t *testing.T) {
+		e, root := setup(t)
+		e.replace("chart/templates/uds-package.yaml", "remoteNamespace: keycloak", "remoteNamespace: elsewhere")
+		fails(t, e.wasb("check", "drift"), "drift", "uds.allow Keycloak egress changed")
+		e.fixDrift()
+		pass(t, e.wasb("check", "drift"))
+		r := e.wasb("check", "requirements")
+		fails(t, r, "requirements", `does not hold: rule.remoteNamespace == "keycloak"`)
+		if !r.Diagnostics[0].New {
+			t.Fatal("want the failure marked new against HEAD")
+		}
+		e.commit(root, "loosen")
+		if r := e.wasb("check", "requirements"); r.Pass || r.Diagnostics[0].New {
+			t.Fatalf("want an old failure after committing it, got %+v", r.Diagnostics)
+		}
+	})
+
+	t.Run("deleting the rule and its element breaks the model", func(t *testing.T) {
+		e, _ := setup(t)
+		e.replace("chart/templates/uds-package.yaml", "      - direction: Egress\n        remoteNamespace: keycloak\n        port: 8080\n        description: \"Keycloak egress\"\n", "")
+		s := e.read(generated)
+		start := strings.Index(s, "    part 'chart/templates/uds-package.yaml#Keycloak egress'")
+		end := start + strings.Index(s[start:], "\n    }\n") + len("\n    }\n")
+		e.write(generated, s[:start]+s[end:])
+		fails(t, e.wasb("check"), "model", "does not parse")
+	})
+
+	t.Run("dropping the satisfy claim", func(t *testing.T) {
+		e, _ := setup(t)
+		e.replace(user, "    satisfy keycloakEgress by Generated::'chart/templates/uds-package.yaml#Keycloak egress';\n", "")
+		e.commit("", "drop claim")
+		r := e.wasb("check")
+		fails(t, r, "requirements", "nothing claims to satisfy this requirement")
+		fails(t, r, "signature", "without a trusted signature")
+	})
+
+	t.Run("requirement without evidence class", func(t *testing.T) {
+		e, _ := setup(t)
+		e.replace(generated, "package Generated {", "package Generated {\n    requirement def Vague;")
+		fails(t, e.wasb("check", "requirements"), "requirements", "requirement has no EvidenceClass")
+	})
+
+	t.Run("runtime evidence is never discharged by the model", func(t *testing.T) {
+		e, _ := setup(t)
+		e.replace(generated, "package Generated {", `package Generated {
+    requirement def Uptime {
+        @WASB::EvidenceClass { evidence = WASB::EvidenceClassKind::runtimeObservation; }
+        subject rule : WASB::UDSAllow;
+        require constraint { rule.remoteNamespace == "nowhere" }
+    }
+    requirement uptime : Uptime;
+    satisfy uptime by Generated::'chart/templates/uds-package.yaml#Keycloak egress';`)
+		r := e.wasb("check", "requirements")
+		pass(t, r)
+		var awaiting []string
+		for _, a := range r.Manifest.AwaitingEvidence {
+			awaiting = append(awaiting, a.Requirement+"="+a.Evidence)
+		}
+		if !slices.Contains(awaiting, "Generated::uptime=runtimeObservation") {
+			t.Fatalf("want uptime awaiting runtime evidence, got %v", awaiting)
+		}
+	})
+}
+
+func TestImportFlow(t *testing.T) {
+	e := newEnv(t)
+	e.fixture(true)
+	e.cli("import")
+	e.cliFails("a model already exists", "import")
+	e.cli("import", "--force")
+	e.write(user, userReqs)
+
+	e.replace("app/app.go", "Run(addr string)", "Run(addr string, port int)")
+	r := e.wasb("check")
+	if r.Mode != "warning-only" || !r.Pass {
+		t.Fatalf("want warnings only before the import is signed, got mode=%s pass=%t", r.Mode, r.Pass)
+	}
+	fails(t, r, "drift", "go.func Server.Run changed")
+
+	e.replace("app/app.go", "Run(addr string, port int)", "Run(addr string)")
+	sign(t, e)
+	e.replace("app/app.go", "Run(addr string)", "Run(addr string, port int)")
+	fails(t, e.wasb("check"), "drift", "go.func Server.Run changed")
+
+	t.Run("unsigned import commit stays warning-only", func(t *testing.T) {
+		e := modeled(t)
+		e.commit("", "import")
+		e.replace("app/app.go", "Run(addr string)", "Run(addr string, port int)")
+		if r := e.wasb("check"); r.Mode != "warning-only" || !r.Pass {
+			t.Fatalf("want warnings only while the import commit is unsigned, got mode=%s pass=%t", r.Mode, r.Pass)
+		}
+	})
+}
+
+func TestPropose(t *testing.T) {
+	e := repo(t, true, storyReqs)
+	sign(t, e)
+	proposed := filepath.Join(e.dir, "stricter.sysml")
+	if err := os.WriteFile(proposed, []byte(strings.Replace(storyReqs, `== "keycloak"`, `== "elsewhere"`, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var p struct {
+		Status, Delta, Regeneration string
+		Constraints                 []struct{ Requirement, Before, After string }
+		Impact                      struct{ NewlyFailing []string }
+	}
+	if err := json.Unmarshal([]byte(e.run(bin, "--json", "--repo", e.repo, "propose", "stricter", user+"="+proposed)), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Status != "pending" || !strings.Contains(p.Delta, `+        require constraint { rule.remoteNamespace == "elsewhere" }`) {
+		t.Fatalf("want a pending proposal with its delta, got %+v", p)
+	}
+	if len(p.Constraints) != 1 || p.Constraints[0].Before != "holds" || p.Constraints[0].After != "violated" || len(p.Impact.NewlyFailing) != 1 {
+		t.Fatalf("want keycloakEgress to go from holds to violated, got %+v", p)
+	}
+	if e.read(user) != storyReqs {
+		t.Fatal("propose changed the model")
+	}
+	pass(t, e.wasb("check"))
+
+	e.cli("propose", "reject", "stricter", "--reason", "too strict")
+	if out := e.run(bin, "--repo", e.repo, "propose", "list"); !strings.Contains(out, "stricter rejected too strict") {
+		t.Fatalf("want the rejection recorded, got %q", out)
+	}
+
+	withFunc := filepath.Join(e.dir, "with-func.sysml")
+	if err := os.WriteFile(withFunc, []byte(strings.Replace(e.read(generated), "package Generated {\n", "package Generated {\n"+missingFunc, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(e.run(bin, "--json", "--repo", e.repo, "propose", "add-func", generated+"="+withFunc)), &p); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(p.Regeneration, "+func Missing() error {") {
+		t.Fatalf("want the stub in the regeneration diff, got %q", p.Regeneration)
+	}
+
+	t.Run("AgentSuggested content in the model", func(t *testing.T) {
+		e.replace(generated, "package Generated {", "package Generated {\n    part idea { @WASB::AgentSuggested; }")
+		fails(t, e.wasb("check", "signature"), "signature", "AgentSuggested content is in the model")
+	})
+}
+
+func TestGenerate(t *testing.T) {
+	e := modeled(t)
+	e.replace(generated, "package Generated {\n", "package Generated {\n"+missingFunc)
+	fails(t, e.wasb("check", "drift"), "drift", "go.func Missing no longer exists")
+	if out := e.run(bin, "--repo", e.repo, "generate"); !strings.Contains(out, "+func Missing() error {") {
+		t.Fatalf("want the stub in the diff, got %q", out)
+	}
+	e.cli("generate", "--write")
+	if s := e.read("app/wasb_generated.go"); !strings.Contains(s, "package app\n") || !strings.Contains(s, "func Missing() error {\n\tpanic(\"wasb: not implemented\")\n}") {
+		t.Fatalf("unexpected stub file:\n%s", s)
+	}
+	pass(t, e.wasb("check", "drift"))
+	pass(t, e.wasb("check", "unmodeled"))
+}
+
+func TestCoverage(t *testing.T) {
+	e := modeled(t)
+	e.replace("app/app.go", "error { return nil }", "error {\n\tif addr == \"\" {\n\t\treturn nil\n\t}\n\treturn nil\n}")
+	pass(t, e.wasb("check", "drift"))
+	r := e.wasb("coverage")
+	pass(t, r)
+	if len(r.Manifest.Files) == 0 || r.Manifest.Files[0].File != "app/app.go" || r.Manifest.Files[0].Modeled != 2 {
+		t.Fatalf("want app/app.go fully modeled, got %+v", r.Manifest.Files)
+	}
+	if len(r.Manifest.KnownGaps) < 6 || r.Manifest.KnownGaps[0].Element != "WASB::Checker" {
+		t.Fatalf("want wasb's own known gaps, got %+v", r.Manifest.KnownGaps)
+	}
+	e.replace(generated, `@WASB::Anchor { path = "app"; kind = "go.func"; id = "Server.Run"; }`,
+		`@WASB::Anchor { path = "app"; kind = "go.func"; id = "Server.Run"; }
+        @WASB::Coverage { generatedFraction = 0.5; }`)
+	fails(t, e.wasb("coverage"), "coverage", "generated fraction 0.17 is below the 0.50 the model requires")
+}
+
+func TestMCP(t *testing.T) {
+	e := modeled(t)
+	ctx := context.Background()
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "e2e"}, nil).
+		Connect(ctx, &mcp.CommandTransport{Command: exec.Command(bin, "--repo", e.repo, "mcp")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.Close() }()
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tool := range tools.Tools {
+		names = append(names, tool.Name)
+	}
+	for _, want := range []string{"check", "status", "coverage", "import", "generate", "propose", "proposals", "model_evaluate", "model_elements", "model_edit"} {
+		if !slices.Contains(names, want) {
+			t.Fatalf("missing tool %s in %v", want, names)
+		}
+	}
+	call := func(name string, args map[string]any) *mcp.CallToolResult {
+		t.Helper()
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if res := call("check", map[string]any{"gate": "drift"}); res.IsError || !res.StructuredContent.(map[string]any)["pass"].(bool) {
+		t.Fatalf("want drift to pass over MCP, got %+v", res)
+	}
+	if res := call("model_evaluate", map[string]any{"expression": "Generated::'app#New'::signature"}); res.IsError || !strings.Contains(res.StructuredContent.(map[string]any)["value"].(string), "func New() *Server") {
+		t.Fatalf("want New's signature, got %+v", res)
+	}
+	if res := call("model_edit", map[string]any{"path": user, "content": "package X {}"}); !res.IsError {
+		t.Fatal("model_edit wrote user requirements")
+	}
+	if res := call("model_edit", map[string]any{"path": generated, "content": "package Broken {"}); !res.IsError {
+		t.Fatal("model_edit accepted a model that does not parse")
+	}
+}
+
+// fauxModel answers every prompt with "done" three times, then runs out, and logs each settle.
+const fauxModel = `import { fauxProvider, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { appendFileSync } from "node:fs";
+export default function (pi: ExtensionAPI) {
+	const faux = fauxProvider();
+	faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("done")));
+	pi.registerProvider(faux.provider);
+	pi.on("agent_settled", () => appendFileSync(process.env.FAUX_LOG!, "modelCalls=" + faux.state.callCount + "\n"));
+}
+`
+
+func TestPiHarness(t *testing.T) {
+	pi := os.Getenv("WASB_PI")
+	if pi == "" {
+		t.Skip("set WASB_PI to a pi >= 1.4 binary")
+	}
+	gateExt, err := filepath.Abs("../../harness/pi/wasb-gate.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(e *env) (settles, out string) {
+		faux, log := filepath.Join(e.dir, "faux.ts"), filepath.Join(e.dir, "faux.log")
+		if err := os.WriteFile(faux, []byte(fauxModel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Remove(log)
+		cmd := exec.Command(pi, "-p", "--mode", "json", "--no-session", "-ne", "-e", faux, "-e", gateExt, "--provider", "faux", "--model", "faux-1", "finish")
+		cmd.Dir = e.repo
+		cmd.Env = append(os.Environ(), "WASB_BIN="+bin, "FAUX_LOG="+log, "PI_CODING_AGENT_DIR="+filepath.Join(e.dir, "pi"))
+		b, _ := cmd.Output()
+		l, _ := os.ReadFile(log)
+		return strings.TrimSpace(string(l)), string(b)
+	}
+
+	e, _ := signed(t)
+	if settles, out := run(e); settles != "modelCalls=1" || strings.Contains(out, `"customType":"wasb-gate"`) {
+		t.Fatalf("want a passing repo to settle after one call, got %q", settles)
+	}
+	e.replace("app/app.go", "Run(addr string)", "Run(addr string, port int)")
+	settles, out := run(e)
+	if n := strings.Count(out, `"customType":"wasb-gate"`); n != 3 || !strings.Contains(out, "go.func Server.Run changed") {
+		t.Fatalf("want every answer gated with the drift diagnostic, got %d gate messages, settles %q", n, settles)
+	}
 }

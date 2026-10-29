@@ -9,15 +9,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"github.com/realnedsanders/wearesoback/src/internal/gate"
+	"github.com/realnedsanders/wearesoback/src/internal/app"
 	"github.com/realnedsanders/wearesoback/src/internal/git"
-	"github.com/realnedsanders/wearesoback/src/internal/model"
 	"github.com/realnedsanders/wearesoback/src/internal/trust"
 )
 
@@ -57,20 +55,19 @@ func rootCmd() *cobra.Command {
 		}
 		return nil
 	}
-	root.AddCommand(checkCmd(), trustCmd())
+	root.AddCommand(checkCmd(), importCmd(), generateCmd(), proposeCmd(), statusCmd(), coverageCmd(), trustCmd(), mcpCmd())
 	return root
 }
-
-var gates = []string{"drift", "unmodeled", "signature"}
 
 func checkCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "check",
 		Short: "Run every gate",
+		Long:  "Run every gate. Until the first commit touching .wasb/ is signed, failures are warnings.",
 		Args:  cobra.NoArgs,
-		RunE:  func(c *cobra.Command, _ []string) error { return check(c, gates...) },
+		RunE:  func(c *cobra.Command, _ []string) error { return check(c, app.Gates...) },
 	}
-	for _, g := range gates {
+	for _, g := range app.Gates {
 		cmd.AddCommand(&cobra.Command{
 			Use:   g,
 			Short: "Run the " + g + " gate",
@@ -81,62 +78,24 @@ func checkCmd() *cobra.Command {
 	return cmd
 }
 
-func check(cmd *cobra.Command, run ...string) error {
-	var ds []gate.Diagnostic
-	fail := func(g string, err error) error {
-		return report(cmd, append(ds, gate.Diagnostic{Gate: g, Message: err.Error()}))
-	}
+func check(cmd *cobra.Command, gates ...string) error {
 	root, err := repoRoot()
 	if err != nil {
-		return fail("wasb", err)
+		return err
 	}
-	files, err := gate.Files(root)
+	r, err := app.Check(cmd.Context(), root, gates...)
 	if err != nil {
-		return fail("wasb", err)
+		return err
 	}
-	var modelFiles []string
-	for _, f := range files {
-		if strings.HasPrefix(f, model.Dir+"/") && strings.HasSuffix(f, ".sysml") {
-			modelFiles = append(modelFiles, f)
-		}
-	}
-	elems, err := model.Load(cmd.Context(), root, modelFiles)
-	if err != nil {
-		return fail("model", err)
-	}
-	var targets []gate.Target
-	if slices.Contains(run, "drift") || slices.Contains(run, "unmodeled") {
-		if targets, err = gate.Targets(root, files); err != nil {
-			return fail("scan", err)
-		}
-	}
-	for _, g := range run {
-		switch g {
-		case "drift":
-			ds = append(ds, gate.Drift(elems, targets)...)
-		case "unmodeled":
-			ds = append(ds, gate.Unmodeled(elems, targets)...)
-		case "signature":
-			ds = append(ds, gate.Signature(root, elems)...)
-		}
-	}
-	return report(cmd, ds)
-}
-
-func report(cmd *cobra.Command, ds []gate.Diagnostic) error {
 	out := cmd.OutOrStdout()
 	if viper.GetBool("json") {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
-		err := enc.Encode(struct {
-			Pass        bool              `json:"pass"`
-			Diagnostics []gate.Diagnostic `json:"diagnostics"`
-		}{len(ds) == 0, append([]gate.Diagnostic{}, ds...)})
-		if err != nil {
+		if err := enc.Encode(r); err != nil {
 			return err
 		}
 	} else {
-		for _, d := range ds {
+		for _, d := range r.Diagnostics {
 			loc := d.Path
 			if d.Line > 0 {
 				loc += fmt.Sprintf(":%d", d.Line)
@@ -144,19 +103,208 @@ func report(cmd *cobra.Command, ds []gate.Diagnostic) error {
 			if d.Element != "" {
 				loc += " " + d.Element
 			}
+			if d.New {
+				loc += " (new)"
+			}
 			_, _ = fmt.Fprintf(out, "%s: [%s] %s\n", loc, d.Gate, d.Message)
 			if d.Fix != "" {
-				_, _ = fmt.Fprintf(out, "    fix: %s\n", d.Fix)
+				_, _ = fmt.Fprintf(out, "    fix: %s\n", strings.ReplaceAll(strings.TrimSpace(d.Fix), "\n", "\n    "))
 			}
 		}
-		if len(ds) == 0 {
+		if m := r.Manifest; m != nil {
+			_, _ = fmt.Fprintf(out, "examined %d files, not %d; %d known gaps; %d requirements await non-structural evidence\n",
+				len(m.Examined), len(m.NotExamined), len(m.KnownGaps), len(m.AwaitingEvidence))
+		}
+		switch {
+		case r.Mode == "warning-only":
+			_, _ = fmt.Fprintf(out, "warning-only: %d findings; the model is not authoritative until the commit adding .wasb/ is signed\n", len(r.Diagnostics))
+		case r.Pass:
 			_, _ = fmt.Fprintln(out, "ok")
 		}
 	}
-	if len(ds) > 0 {
+	if !r.Pass {
 		return errFailed
 	}
 	return nil
+}
+
+func importCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "import",
+		Short: "Propose a model of the repository under .wasb/model/generated and stop",
+		Long: "Walk the repository, write a model of every target to " + ".wasb/model/generated/import.sysml" + ",\n" +
+			"and write the coverage report. The model is not authoritative until you add a trusted key\n" +
+			"(wasb trust add, wasb trust sign) and commit .wasb/ signed with it.",
+		Args: cobra.NoArgs,
+		RunE: func(c *cobra.Command, _ []string) error {
+			root, err := repoRoot()
+			if err != nil {
+				return err
+			}
+			force, _ := c.Flags().GetBool("force")
+			res, err := app.Import(c.Context(), root, force)
+			if err != nil {
+				return err
+			}
+			text := fmt.Sprintf("modeled %v\nwrote %s\nnot examined: %d files (see %s)\nnext: wasb trust add <key>; wasb trust sign; git add .wasb && git commit -S\n",
+				res.Targets, strings.Join(res.Written, ", "), len(res.Manifest.NotExamined), ".wasb/coverage/import.json")
+			return emit(c, res, text)
+		},
+	}
+	cmd.Flags().Bool("force", false, "rewrite the imported model when one exists")
+	return cmd
+}
+
+func generateCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "generate",
+		Short: "Show, or with --write create, Go stubs for modeled functions that do not exist yet",
+		Args:  cobra.NoArgs,
+		RunE: func(c *cobra.Command, _ []string) error {
+			root, err := repoRoot()
+			if err != nil {
+				return err
+			}
+			write, _ := c.Flags().GetBool("write")
+			d, err := app.Generate(c.Context(), root, write)
+			if err != nil {
+				return err
+			}
+			return emit(c, map[string]any{"diff": d, "written": write}, d)
+		},
+	}
+	cmd.Flags().Bool("write", false, "write the stubs")
+	return cmd
+}
+
+func proposeCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "propose <name> <model-file>=<proposed-file>...",
+		Short: "Record a suggested model change with its delta, constraint changes, regeneration diff and impact",
+		Long: "Record a proposal in .wasb/proposals/<name>.json. It changes nothing in the model.\n" +
+			"Acceptance is a normal edit plus a signed commit that moves the content into the model,\n" +
+			"removes its @WASB::AgentSuggested marks and deletes the proposal.",
+		Args: cobra.MinimumNArgs(2),
+		RunE: func(c *cobra.Command, args []string) error {
+			root, err := repoRoot()
+			if err != nil {
+				return err
+			}
+			files := map[string]string{}
+			for _, a := range args[1:] {
+				target, src, ok := strings.Cut(a, "=")
+				if !ok {
+					return fmt.Errorf("%q: want <model-file>=<proposed-file>", a)
+				}
+				b, err := os.ReadFile(src)
+				if err != nil {
+					return err
+				}
+				files[target] = string(b)
+			}
+			p, err := app.Propose(c.Context(), root, args[0], files)
+			if err != nil {
+				return err
+			}
+			text := fmt.Sprintf("%s\nconstraints changing: %d\nnewly failing: %v\nnewly passing: %v\n", p.Delta, len(p.Constraints), p.Impact.NewlyFailing, p.Impact.NewlyPassing)
+			return emit(c, p, text)
+		},
+	}
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List proposals",
+		Args:  cobra.NoArgs,
+		RunE: func(c *cobra.Command, _ []string) error {
+			root, err := repoRoot()
+			if err != nil {
+				return err
+			}
+			ps, err := app.ListProposals(root)
+			if err != nil {
+				return err
+			}
+			text := ""
+			for _, p := range ps {
+				text += fmt.Sprintf("%s %s %s\n", p.Name, p.Status, p.Reason)
+			}
+			return emit(c, ps, text)
+		},
+	}
+	reject := &cobra.Command{
+		Use:   "reject <name>",
+		Short: "Record that a proposal was rejected",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			root, err := repoRoot()
+			if err != nil {
+				return err
+			}
+			reason, _ := c.Flags().GetString("reason")
+			if err := app.Reject(root, args[0], reason); err != nil {
+				return err
+			}
+			return emit(c, map[string]string{"rejected": args[0]}, "rejected "+args[0]+"\n")
+		},
+	}
+	reject.Flags().String("reason", "", "why")
+	cmd.AddCommand(list, reject)
+	return cmd
+}
+
+func statusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Summarize the model, the gates, the trust chain and proposals",
+		Args:  cobra.NoArgs,
+		RunE: func(c *cobra.Command, _ []string) error {
+			root, err := repoRoot()
+			if err != nil {
+				return err
+			}
+			s, err := app.GetStatus(c.Context(), root)
+			if err != nil {
+				return err
+			}
+			text := fmt.Sprintf("mode %s, pass %t, failures by gate %v\n%d targets, %d anchored elements\ntrust: %d keys, pending version %t\nproposals %v\n",
+				s.Mode, s.Pass, s.Diagnostics, s.Targets, s.Elements, s.TrustKeys, s.TrustPending, s.Proposals)
+			return emit(c, s, text)
+		},
+	}
+}
+
+func coverageCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "coverage",
+		Short: "Report per-file and per-element coverage and run the coverage gate",
+		Args:  cobra.NoArgs,
+		RunE: func(c *cobra.Command, _ []string) error {
+			root, err := repoRoot()
+			if err != nil {
+				return err
+			}
+			r, err := app.Check(c.Context(), root, "coverage")
+			if err != nil {
+				return err
+			}
+			if r.Manifest == nil {
+				return fmt.Errorf("%s", r.Diagnostics[0].Message)
+			}
+			text := ""
+			for _, f := range r.Manifest.Files {
+				text += fmt.Sprintf("%-60s %3d/%-3d modeled  %5.1f%% generated\n", f.File, f.Modeled, f.Targets, 100*f.Generated)
+			}
+			for _, d := range r.Diagnostics {
+				text += fmt.Sprintf("%s: %s\n", d.Element, d.Message)
+			}
+			if err := emit(c, r, text); err != nil {
+				return err
+			}
+			if !r.Pass {
+				return errFailed
+			}
+			return nil
+		},
+	}
 }
 
 func trustCmd() *cobra.Command {

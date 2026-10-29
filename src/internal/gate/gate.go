@@ -20,18 +20,31 @@ type Diagnostic struct {
 	Line    int    `json:"line,omitempty"`
 	Message string `json:"message"`
 	Fix     string `json:"fix,omitempty"`
+	// New marks a requirement failure the last commit did not have.
+	New bool `json:"new,omitempty"`
 }
-
-var kinds = map[string]string{"go.func": "action def", "zarf.component": "part def"}
 
 func key(kind, path, id string) string { return kind + "\x00" + path + "\x00" + id }
 
-// Drift fails anchored elements whose target changed or disappeared while the element did not.
-func Drift(elems []model.Element, targets []Target) []Diagnostic {
+// Index maps targets by anchor key.
+func Index(targets []Target) map[string]Target {
 	byKey := map[string]Target{}
 	for _, t := range targets {
 		byKey[key(t.Kind, t.Path, t.ID)] = t
 	}
+	return byKey
+}
+
+// Find returns the target an anchor points at.
+func Find(byKey map[string]Target, a *model.Anchor) (Target, bool) {
+	t, ok := byKey[key(a.Kind, a.Path, a.ID)]
+	return t, ok
+}
+
+// Drift fails anchored elements whose target changed or disappeared while the
+// element did not, and elements whose attributes disagree with their target.
+func Drift(elems []model.Element, targets []Target) []Diagnostic {
+	byKey := Index(targets)
 	var ds []Diagnostic
 	claimed := map[string]string{}
 	for _, e := range elems {
@@ -42,8 +55,14 @@ func Drift(elems []model.Element, targets []Target) []Diagnostic {
 		k := key(a.Kind, a.Path, a.ID)
 		t, found := byKey[k]
 		d := Diagnostic{Gate: "drift", Element: e.ID, Path: a.Path}
+		var differ []string
+		for _, attr := range model.Kinds[a.Kind].Attrs {
+			if e.Attrs[attr.Name] != t.Attrs[attr.Name] {
+				differ = append(differ, fmt.Sprintf("%s is %s, the model says %s", attr.Name, orUnset(t.Attrs[attr.Name]), orUnset(e.Attrs[attr.Name])))
+			}
+		}
 		switch {
-		case kinds[a.Kind] == "":
+		case model.Kinds[a.Kind].Def == "":
 			d.Message = fmt.Sprintf("unsupported anchor kind %q", a.Kind)
 		case claimed[k] != "":
 			d.Message = fmt.Sprintf("%s %s is already anchored by %s", a.Kind, a.ID, claimed[k])
@@ -51,10 +70,14 @@ func Drift(elems []model.Element, targets []Target) []Diagnostic {
 		case !found:
 			d.Message = fmt.Sprintf("%s %s no longer exists but the model still claims it", a.Kind, a.ID)
 			d.Fix = fmt.Sprintf("restore it, delete %s from the model, or mark it @WASB::Detached", e.ID)
-		case t.Hash != e.LastHash:
+		case t.Hash != e.LastHash && (e.LastHash != "" || !model.Kinds[a.Kind].Complete):
 			d.Path, d.Line = t.File, t.Line
 			d.Message = fmt.Sprintf("%s %s changed but the model did not", a.Kind, a.ID)
-			d.Fix = fmt.Sprintf("update %s to match and set Coverage.lastHash = %q", e.ID, t.Hash)
+			d.Fix = "replace " + e.ID + " with\n" + t.SysML()
+		case len(differ) > 0:
+			d.Path, d.Line = t.File, t.Line
+			d.Message = fmt.Sprintf("the model disagrees with %s %s: %s", a.Kind, a.ID, strings.Join(differ, "; "))
+			d.Fix = "replace " + e.ID + " with\n" + t.SysML()
 		}
 		claimed[k] = e.ID
 		if d.Message != "" {
@@ -62,6 +85,13 @@ func Drift(elems []model.Element, targets []Target) []Diagnostic {
 		}
 	}
 	return ds
+}
+
+func orUnset(lit string) string {
+	if lit == "" {
+		return "unset"
+	}
+	return lit
 }
 
 // Unmodeled fails targets that no model element anchors.
@@ -74,19 +104,78 @@ func Unmodeled(elems []model.Element, targets []Target) []Diagnostic {
 	}
 	var ds []Diagnostic
 	for _, t := range targets {
-		if anchored[key(t.Kind, t.Path, t.ID)] {
-			continue
+		if !anchored[key(t.Kind, t.Path, t.ID)] {
+			ds = append(ds, Diagnostic{Gate: "unmodeled", Path: t.File, Line: t.Line,
+				Message: fmt.Sprintf("%s %s is not modeled", t.Kind, t.ID), Fix: t.SysML()})
 		}
-		ds = append(ds, Diagnostic{
-			Gate:    "unmodeled",
-			Path:    t.File,
-			Line:    t.Line,
-			Message: fmt.Sprintf("%s %s is not modeled", t.Kind, t.ID),
-			Fix: fmt.Sprintf("%s '%s#%s' { @WASB::Anchor { path = %q; kind = %q; id = %q; } @WASB::Coverage { lastHash = %q; } }",
-				kinds[t.Kind], t.Path, t.ID, t.Path, t.Kind, t.ID, t.Hash),
-		})
 	}
 	return ds
+}
+
+// Coverage fails anchored elements whose target's generated fraction dropped
+// below the minimum the element sets in Coverage.generatedFraction.
+func Coverage(elems []model.Element, targets []Target) []Diagnostic {
+	byKey := Index(targets)
+	var ds []Diagnostic
+	for _, e := range elems {
+		if e.Anchor == nil || e.MinFraction == 0 {
+			continue
+		}
+		if t, ok := Find(byKey, e.Anchor); ok && t.Fraction < e.MinFraction {
+			ds = append(ds, Diagnostic{Gate: "coverage", Element: e.ID, Path: t.File, Line: t.Line,
+				Message: fmt.Sprintf("generated fraction %.2f is below the %.2f the model requires", t.Fraction, e.MinFraction),
+				Fix:     "move hand-written code out of " + t.ID + ", or lower Coverage.generatedFraction with a signed commit"})
+		}
+	}
+	return ds
+}
+
+// Awaiting is a requirement the model cannot discharge because its evidence is not structural.
+type Awaiting struct {
+	Requirement string `json:"requirement"`
+	Evidence    string `json:"evidence"`
+}
+
+// Requirements fails requirements without an evidence class, structural
+// satisfy assertions the model violates or cannot decide, and UserDeclared
+// structural requirement usages nothing claims to satisfy. Requirements of
+// other evidence classes are returned as awaiting evidence, never discharged.
+func Requirements(reqs []model.Requirement, verdicts []model.Verdict) ([]Diagnostic, []Awaiting) {
+	var ds []Diagnostic
+	var awaiting []Awaiting
+	evidence := map[string]string{}
+	fail := func(r model.Requirement, msg, fix string) {
+		path := ""
+		if len(r.Files) > 0 {
+			path = r.Files[0]
+		}
+		ds = append(ds, Diagnostic{Gate: "requirements", Element: r.ID, Path: path, Message: msg, Fix: fix})
+	}
+	for _, r := range reqs {
+		evidence[r.ID] = r.Evidence
+		switch {
+		case r.Evidence == "":
+			fail(r, "requirement has no EvidenceClass", "add @WASB::EvidenceClass { evidence = WASB::EvidenceClassKind::structural; } or another class")
+		case r.Evidence != "structural":
+			awaiting = append(awaiting, Awaiting{Requirement: r.ID, Evidence: r.Evidence})
+		case r.Usage && r.UserDeclared && !r.Claimed:
+			fail(r, "nothing claims to satisfy this requirement", "add a satisfy assertion naming it")
+		}
+	}
+	for _, v := range verdicts {
+		if evidence[v.Requirement] != "structural" {
+			continue
+		}
+		r := model.Requirement{ID: v.Requirement}
+		switch v.Status {
+		case "holds":
+		case "violated":
+			fail(r, fmt.Sprintf("%s does not hold: %s", v.Assertion, v.Condition), "change the model or the code it anchors until it holds")
+		default:
+			fail(r, fmt.Sprintf("%s cannot be decided: %s", v.Assertion, v.Error), "give the subject the values the requirement reads")
+		}
+	}
+	return ds, awaiting
 }
 
 // Signature fails changes to protected content that a trusted key did not sign.
@@ -100,6 +189,10 @@ func Signature(root string, elems []model.Element) []Diagnostic {
 	}
 
 	for _, e := range elems {
+		if e.AgentSuggested {
+			ds = append(ds, Diagnostic{Gate: "signature", Element: e.ID, Path: strings.Join(e.Files, ","),
+				Message: "AgentSuggested content is in the model", Fix: "accept it (remove the mark, signed commit) or move it back to a proposal"})
+		}
 		for _, f := range e.Files {
 			if e.UserDeclared && !strings.HasPrefix(f, model.UserDir+"/") {
 				ds = append(ds, Diagnostic{Gate: "signature", Element: e.ID, Path: f,
