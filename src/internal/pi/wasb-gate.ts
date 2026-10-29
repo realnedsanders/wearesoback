@@ -1,7 +1,7 @@
 // wasb gate for pi (>= 1.4): the agent may not settle while `wasb check --json` fails.
 //
-// Load it with `pi -e harness/pi/wasb-gate.ts`, or copy it to ~/.pi/agent/extensions/.
-// Set WASB_BIN to an absolute path so a wasb planted earlier on PATH cannot answer for it.
+// `wasb init` installs this into pi's personal extensions with wasb's absolute path filled in,
+// so a wasb planted earlier on PATH cannot answer for it. WASB_BIN overrides that path.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const WASB = process.env.WASB_BIN || "wasb";
@@ -28,7 +28,8 @@ export default function (pi: ExtensionAPI) {
 async function check(pi: ExtensionAPI, cwd: string, signal: AbortSignal | undefined): Promise<string | undefined> {
 	let r: Awaited<ReturnType<ExtensionAPI["exec"]>>;
 	try {
-		r = await pi.exec(WASB, ["check", "--json"], { cwd, signal, timeout: TIMEOUT_MS });
+		// --if-managed passes where no commit has touched .wasb/, so other projects are left alone.
+		r = await pi.exec(WASB, ["check", "--json", "--if-managed"], { cwd, signal, timeout: TIMEOUT_MS });
 	} catch (err) {
 		return `wasb gate: could not run \`${WASB} check --json\`: ${String(err)}. You may not finish until it runs and passes.`;
 	}

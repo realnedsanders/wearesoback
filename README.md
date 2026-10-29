@@ -38,6 +38,7 @@ go install github.com/realnedsanders/wearesoback/src/cmd/wasb@latest
 ## Usage (vibe)
 
 ```bash
+wasb init                        # once per machine: pi won't let an agent finish while wasb check fails
 wasb import                      # propose the model; nothing is authoritative yet
 wasb trust add ~/.ssh/id_ed25519.pub   # or a GPG key id
 wasb trust sign                  # uses git's gpg.format and user.signingkey
@@ -73,9 +74,10 @@ Any key of the previous version signs the next one, and version 1 must be signed
 Lost your key?
 A teammate runs `wasb trust add <your new key>` and `wasb trust sign`.
 
-The harness is a pi (>= 1.4) extension: `pi -e harness/pi/wasb-gate.ts`, or copy it to `~/.pi/agent/extensions/`.
-Set `WASB_BIN` to wasb's absolute path.
-Before the agent may stop, it runs `wasb check --json`; on failure it pastes the diagnostics back in and declines to stop.
+The harness is a pi (>= 1.4) extension, and `wasb init` installs it into `~/.pi/agent/extensions/` with wasb's absolute path baked in.
+Re-run it after moving or upgrading wasb.
+Before the agent may stop, it runs `wasb check --json --if-managed`; on failure it pastes the diagnostics back in and declines to stop.
+Repositories where no commit has touched `.wasb/` are left alone. Deleting `.wasb/` doesn't count.
 There is no “just this once".
 
 ## The bit

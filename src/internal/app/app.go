@@ -113,6 +113,17 @@ func Check(ctx context.Context, root string, gates ...string) (*Report, error) {
 	return r, nil
 }
 
+// Managed reports whether dir is in a git repository where some commit has
+// touched .wasb/. Deleting .wasb/ afterwards does not unmanage it.
+func Managed(dir string) bool {
+	root, err := git.Run(dir, nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return false
+	}
+	out, err := git.Run(root, nil, "log", "-1", "--format=%H", "--", ".wasb")
+	return err == nil && out != ""
+}
+
 // imported reports whether the first commit touching .wasb/ carries a
 // signature. Until it does the model is not authoritative. Whether the
 // signature is trusted is the signature gate's question.

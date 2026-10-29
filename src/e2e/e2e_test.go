@@ -896,28 +896,101 @@ export default function (pi: ExtensionAPI) {
 }
 `
 
+// initPi installs the gate with wasb init into a fresh pi agent directory and returns it.
+func (e *env) initPi(path string) string {
+	e.t.Helper()
+	agent := filepath.Join(e.dir, "pi")
+	cmd := exec.Command(bin, "init")
+	cmd.Env = append(os.Environ(), "PI_CODING_AGENT_DIR="+agent, "PATH="+path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		e.t.Fatalf("wasb init: %v\n%s", err, out)
+	}
+	return agent
+}
+
+func TestInit(t *testing.T) {
+	e := newEnv(t)
+	agent := e.initPi(os.Getenv("PATH"))
+	gate := e.read("../pi/extensions/wasb-gate.ts")
+	if !strings.Contains(gate, `process.env.WASB_BIN || "`+bin+`";`) || !strings.Contains(gate, `"--if-managed"`) {
+		t.Fatalf("want the gate pointed at %s with --if-managed, got:\n%s", bin, gate)
+	}
+	if agent != filepath.Join(e.dir, "pi") {
+		t.Fatal("init ignored PI_CODING_AGENT_DIR")
+	}
+
+	t.Run("refuses a pi without agent_before_settle", func(t *testing.T) {
+		old := filepath.Join(e.dir, "oldpi")
+		if err := os.MkdirAll(old, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(old, "pi"), []byte("#!/bin/sh\necho 1.1.0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(bin, "init")
+		cmd.Env = append(os.Environ(), "PI_CODING_AGENT_DIR="+filepath.Join(e.dir, "pi-old"), "PATH="+old+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "pi 1.1.0 is too old") {
+			t.Fatalf("want init to refuse pi 1.1.0, got %v: %s", err, out)
+		}
+	})
+
+	t.Run("if-managed", func(t *testing.T) {
+		outside := &env{t: t, dir: t.TempDir()}
+		outside.repo, outside.cfg = outside.dir, filepath.Join(outside.dir, "cfg")
+		if r := outside.wasb("check", "--if-managed"); r.Mode != "unmanaged" || !r.Pass {
+			t.Fatalf("want outside a repository unmanaged, got %+v", r)
+		}
+		fresh := newEnv(t)
+		fresh.fixture(false)
+		if r := fresh.wasb("check", "--if-managed"); r.Mode != "unmanaged" {
+			t.Fatalf("want a repository without .wasb commits unmanaged, got %s", r.Mode)
+		}
+		managed, _ := signed(t)
+		managed.replace("app/app.go", "Run(addr string)", "Run(addr string, port int)")
+		fails(t, managed.wasb("check", "--if-managed"), "drift", "go.func Server.Run changed")
+		if err := os.RemoveAll(filepath.Join(managed.repo, ".wasb")); err != nil {
+			t.Fatal(err)
+		}
+		managed.commit("", "drop the model")
+		if r := managed.wasb("check", "--if-managed"); r.Pass || r.Mode == "unmanaged" {
+			t.Fatalf("want deleting .wasb/ to leave the repository gated, got %+v", r)
+		}
+	})
+}
+
 func TestPiHarness(t *testing.T) {
 	pi := os.Getenv("WASB_PI")
 	if pi == "" {
-		t.Skip("set WASB_PI to a pi >= 1.4 binary")
+		pi, _ = exec.LookPath("pi")
 	}
-	gateExt, err := filepath.Abs("../../harness/pi/wasb-gate.ts")
-	if err != nil {
-		t.Fatal(err)
+	if pi == "" {
+		t.Skip("no pi on PATH; set WASB_PI to a pi >= 1.4 binary")
 	}
 	run := func(e *env) (settles, out string) {
+		agent := e.initPi(filepath.Dir(pi) + string(os.PathListSeparator) + os.Getenv("PATH"))
 		faux, log := filepath.Join(e.dir, "faux.ts"), filepath.Join(e.dir, "faux.log")
 		if err := os.WriteFile(faux, []byte(fauxModel), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		_ = os.Remove(log)
-		cmd := exec.Command(pi, "-p", "--mode", "json", "--no-session", "-ne", "-e", faux, "-e", gateExt, "--provider", "faux", "--model", "faux-1", "finish")
+		cmd := exec.Command(pi, "-p", "--mode", "json", "--no-session", "-e", faux, "--provider", "faux", "--model", "faux-1", "finish")
 		cmd.Dir = e.repo
-		cmd.Env = append(os.Environ(), "WASB_BIN="+bin, "FAUX_LOG="+log, "PI_CODING_AGENT_DIR="+filepath.Join(e.dir, "pi"))
+		cmd.Env = append(os.Environ(), "FAUX_LOG="+log, "PI_CODING_AGENT_DIR="+agent)
 		b, _ := cmd.Output()
 		l, _ := os.ReadFile(log)
 		return strings.TrimSpace(string(l)), string(b)
 	}
+
+	t.Run("a directory outside any repository is left alone", func(t *testing.T) {
+		e := &env{t: t, dir: t.TempDir()}
+		e.repo = filepath.Join(e.dir, "work")
+		if err := os.Mkdir(e.repo, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if settles, out := run(e); settles != "modelCalls=1" || strings.Contains(out, `"customType":"wasb-gate"`) {
+			t.Fatalf("want a plain directory to settle after one call, got %q", settles)
+		}
+	})
 
 	e, _ := signed(t)
 	if settles, out := run(e); settles != "modelCalls=1" || strings.Contains(out, `"customType":"wasb-gate"`) {

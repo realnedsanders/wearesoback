@@ -15,7 +15,9 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/realnedsanders/wearesoback/src/internal/app"
+	"github.com/realnedsanders/wearesoback/src/internal/gate"
 	"github.com/realnedsanders/wearesoback/src/internal/git"
+	"github.com/realnedsanders/wearesoback/src/internal/pi"
 	"github.com/realnedsanders/wearesoback/src/internal/trust"
 )
 
@@ -55,8 +57,35 @@ func rootCmd() *cobra.Command {
 		}
 		return nil
 	}
-	root.AddCommand(checkCmd(), importCmd(), generateCmd(), proposeCmd(), statusCmd(), coverageCmd(), trustCmd(), mcpCmd())
+	root.AddCommand(initCmd(), checkCmd(), importCmd(), generateCmd(), proposeCmd(), statusCmd(), coverageCmd(), trustCmd(), mcpCmd())
 	return root
+}
+
+func initCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "init",
+		Short: "Install the pi gate: an agent in pi cannot finish while wasb check fails",
+		Long: "Write wasb's gate into pi's personal extensions ($PI_CODING_AGENT_DIR, else ~/.pi/agent),\n" +
+			"pointed at this wasb binary by absolute path. It gates every pi session in a repository\n" +
+			"where a commit has touched .wasb/, and leaves other directories alone. Run it again after\n" +
+			"moving or upgrading wasb. Needs pi 1.4 or later.",
+		Args: cobra.NoArgs,
+		RunE: func(c *cobra.Command, _ []string) error {
+			bin, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			if bin, err = filepath.EvalSymlinks(bin); err != nil {
+				return err
+			}
+			path, err := pi.Install(bin)
+			if err != nil {
+				return err
+			}
+			return emit(c, map[string]string{"extension": path, "wasb": bin},
+				fmt.Sprintf("installed %s\nthe gate runs %s; restart pi or run /reload\n", path, bin))
+		},
+	}
 }
 
 func checkCmd() *cobra.Command {
@@ -67,6 +96,7 @@ func checkCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE:  func(c *cobra.Command, _ []string) error { return check(c, app.Gates...) },
 	}
+	cmd.PersistentFlags().Bool("if-managed", false, "pass without checking unless a commit has touched .wasb/ (the pi gate uses this)")
 	for _, g := range app.Gates {
 		cmd.AddCommand(&cobra.Command{
 			Use:   g,
@@ -79,6 +109,9 @@ func checkCmd() *cobra.Command {
 }
 
 func check(cmd *cobra.Command, gates ...string) error {
+	if ifManaged, _ := cmd.Flags().GetBool("if-managed"); ifManaged && !app.Managed(viper.GetString("repo")) {
+		return emit(cmd, app.Report{Pass: true, Mode: "unmanaged", Diagnostics: []gate.Diagnostic{}}, "unmanaged: no commit has touched .wasb/\n")
+	}
 	root, err := repoRoot()
 	if err != nil {
 		return err
