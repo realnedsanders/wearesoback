@@ -83,7 +83,7 @@ func initCmd() *cobra.Command {
 				return err
 			}
 			return emit(c, map[string]string{"extension": path, "wasb": bin},
-				fmt.Sprintf("installed %s\nthe gate runs %s; restart pi or run /reload\n", path, bin))
+				fmt.Sprintf("installed: %s\nwasb path: %s\nrestart pi or run /reload\n", path, bin))
 		},
 	}
 }
