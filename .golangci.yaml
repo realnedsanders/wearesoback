@@ -1,0 +1,27 @@
+# golangci-lint configuration for the symphony module.
+# Docs: https://golangci-lint.run/usage/configuration/
+
+version: "2"
+
+run:
+  timeout: 5m
+  # Dolt's SQL engine builds without cgo only with this tag (ADR 0043).
+  build-tags:
+    - gms_pure_go
+
+linters:
+  default: standard
+  enable:
+    - misspell
+    - revive
+  settings:
+    revive:
+      rules:
+        - name: var-naming
+        - name: unused-parameter
+          disabled: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

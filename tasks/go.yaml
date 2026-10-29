@@ -1,0 +1,95 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/defenseunicorns/uds-cli/refs/heads/main/tasks.schema.json
+
+variables:
+  - name: SYFT_VERSION
+    default: "v1.54.0"
+  - name: GRYPE_VERSION
+    default: "v0.120.0"
+  - name: GO_IMAGE
+    # default: "golang:1.27-alpine"
+    default: "golang:1.27"
+
+tasks:
+  - name: default
+    actions:
+      - task: all
+
+  - name: all
+    actions:
+      - task: mod
+      - task: fmt
+      - task: lint
+      - task: test-all
+      - task: build
+      - task: scan
+
+  - name: mod
+    description: Verify go.mod and go.sum are tidy and valid
+    actions:
+      - cmd: docker run --rm -v "${PWD}:/src" -w /src ${GO_IMAGE} go mod tidy -diff
+        dir: src
+      - cmd: docker run --rm -v "${PWD}:/src" -w /src ${GO_IMAGE} go mod verify
+        dir: src
+
+  - name: fmt
+    description: Run golangci-lint formatters
+    actions:
+      - cmd: golangci-lint fmt
+        dir: src
+
+  - name: lint
+    description: Run golangci-lint
+    actions:
+      - cmd: golangci-lint run
+        dir: src
+
+  - name: test-all
+    description: Run tests
+    actions:
+      - task: test
+      - task: test-race
+
+  - name: test
+    description: Run unit and integration tests with coverage
+    actions:
+      - cmd: docker run --rm -v "${PWD}:/src" -w /src ${GO_IMAGE} go test -failfast -coverprofile=coverage.out -covermode=atomic ./...
+        dir: src
+      - cmd: docker run --rm -v "${PWD}:/src" -w /src ${GO_IMAGE} go tool cover -func=coverage.out
+        dir: src
+
+  - name: test-race
+    description: Run tests with go race detector
+    actions:
+      - cmd: docker run --rm -v "${PWD}:/src" -w /src --env CGO_ENABLED=1 ${GO_IMAGE} go test -tags ${GO_TAGS} -race -failfast ./...
+        dir: src
+
+  - name: build
+    description: Build the container
+    actions:
+      - cmd: mkdir -p build
+      - cmd: docker run --rm -v "${PWD}:/project" -w /project/src -e "CGO_ENABLED=0" ${GO_IMAGE} go build -tags gms_pure_go -trimpath -ldflags="-s -w" -o /project/build/wasb ./cmd/wasb
+
+  - name: scan
+    description: Run scanners
+    actions:
+      - task: govulncheck
+      - task: syft
+      - task: grype
+
+  - name: govulncheck
+    description: Run govulncheck in the Dockerfile Go image
+    actions:
+      - cmd: docker run --rm -v "${PWD}:/src" -w /src ${GO_IMAGE} ls -lah && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        dir: src
+
+  - name: syft
+    description: Run syft
+    actions:
+      - cmd: docker run --rm -v "${PWD}:/src" -w "/src" anchore/syft:${SYFT_VERSION} . -o table -o json=${PROJECT_NAME}.sbom.json
+        dir: src
+
+  - name: grype
+    description: Run grype
+    actions:
+      - cmd: docker run --rm -v "${PWD}:/src" -w "/src" anchore/grype:${GRYPE_VERSION} . -o table -o json=${PROJECT_NAME}.scan.json
+        dir: src

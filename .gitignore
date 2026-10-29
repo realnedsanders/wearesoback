@@ -1,0 +1,5 @@
+SPEC.md
+coverage.out
+*.sbom.json
+*.scan.json
+build/

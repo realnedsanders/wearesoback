@@ -1,0 +1,2 @@
+includes:
+  - go: tasks/go.yaml
