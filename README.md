@@ -1,29 +1,18 @@
 # We Are So Back (wasb)
 
-> the agent said “we’re so back”  
-> the gate responds “this is slop”  
-> the signed commit said “no.”
+**wasb** is what happens when you get tired of your agents treating your instructions like optional lore.
 
-**wasb** is an unhinged structural backpressure harness I vibe coded after my agents kept quietly deleting NetworkPolicies and then writing a heartfelt retrospectives about how the architecture is now “more fluid”.
+It keeps a SysML v2 model in `.wasb/` and demands the rest of the repo to explain itself.
+When the agents try to pretend like they didn't know not to delete your NetworkPolicies (for the hundredth time), the gates return structured diagnostics and refuse to let the loop continue.
 
-It keeps a SysML v2 model in `.wasb/` as the only adult in the repository.
-Everything else is either generated from that model or living on borrowed time inside an anchor. 
-When the agent tries to freestyle, the gates return structured diagnostics and refuse to let the loop continue until the model and the files are on speaking terms again.
+## What it does
 
-## What it actually does
-
-- One-time import that stares at your Go, zarf.yaml, Helm chart, tasks.yaml, UDS Package CR, and GitHub Actions and proposes a model. The model is not real until you sign the commit.
-- Drift gate: “you changed the file and not the model.”
-- Unmodeled gate: “you added a function / template / job / resource and pretended we wouldn’t notice”.
-- Requirements gate: evaluates the actual constraints. Structural green does not discharge a runtime-class requirement. EvidenceClass is not optional.
-- Signature gate: user-declared requirements live behind a YubiKey (or equivalent). The agent can *suggest*. It cannot *accept*.
-- Coverage metrics so you can watch the generated fraction slowly evaporate and feel something.
-- Explicit known gaps, so the tool doesn’t get to pretend it sees everything.
-
-Hard stops live in a thin harness wrapper, not in “the MCP server probably has a tool for that”.
-The agent gets the diagnostics.
-The loop does not advance.
-This is the entire product.
+- Import: write fanfic about your repo.
+- Drift gate: "forgot to update the 978 docs pages that reference this one line of code".
+- Unmodeled gate: "added a function / template / job / resource and pretended we wouldn't notice (we didn't)".
+- Requirements gate: "did the opposite of what you asked it to do 3 seconds ago".
+- Signature gate: "tried to larp as you approving itself".
+- Coverage metrics: shows the futility of your efforts in real time.
 
 ## Installation
 
@@ -31,9 +20,10 @@ This is the entire product.
 
 ```bash
 go install github.com/realnedsanders/wearesoback/src/cmd/wasb@latest
+wasb init
 ```
 
-2. Accept that you are now the person who has to explain this name in stand-up.
+2. Accept that you are now the person who has to explain this name in standup.
 
 ## Usage (vibe)
 
@@ -55,46 +45,26 @@ wasb coverage
 wasb mcp                         # the same operations as MCP tools, minus the teeth
 ```
 
-Requirements live in `.wasb/model/user/` and need an `@WASB::EvidenceClass`.
-Generated elements are typed by `WASB::UDSAllow`, `WASB::GoFunc` and friends, so a requirement can read their attributes:
-
-```sysml
-requirement def KeycloakEgress {
-    @UserDeclared;
-    @EvidenceClass { evidence = EvidenceClassKind::structural; }
-    subject rule : UDSAllow;
-    require constraint { rule.remoteNamespace == "keycloak" }
-}
-requirement keycloakEgress : KeycloakEgress { @UserDeclared; }
-satisfy keycloakEgress by Generated::'chart/templates/uds-package.yaml#Keycloak egress';
-```
-
 Trusted keys live in `.wasb/trust.yaml`.
 Any key of the previous version signs the next one, and version 1 must be signed by whoever signed the first commit touching `.wasb/`.
 Lost your key?
 A teammate runs `wasb trust add <your new key>` and `wasb trust sign`.
 
-The harness is a pi (>= 1.4) extension, and `wasb init` installs it into `~/.pi/agent/extensions/` with wasb's absolute path baked in.
-Re-run it after moving or upgrading wasb.
-Before the agent may stop, it runs `wasb check --json --if-managed`; on failure it pastes the diagnostics back in and declines to stop.
-Repositories where no commit has touched `.wasb/` are left alone. Deleting `.wasb/` doesn't count.
-There is no “just this once".
+The gates are enforced by a pi (>= 1.4) extension.
+Before the agent may stop, it runs `wasb check --json`; on failure it pastes the diagnostics back in and declines to stop.
+There is no "just this once".
 
 ## The bit
 
-wasb does not make your agent smarter.
-It makes the substrate less forgiving.
+wasb works like [structural backpressure](https://reubenbrooks.dev/blog/structural-backpressure-beats-smarter-agents/).
 
 If the agent wants to change an invariant it must show the blast radius, the constraints that flip, and the regeneration diff.
-You sign or you don’t.
+You sign or you don't.
 The history remembers which suggestions you rejected.
 Later turns can see the pattern.
 
-This is as close to “accountability” as a language model is going to get without a union.
-
 Best-practice libraries layer like agent configs: global, then user, then repo.
 Specialization and redefinition handle overrides.
-The signature gate still applies if you marked the result `UserDeclared`.
 
 ## Status
 
