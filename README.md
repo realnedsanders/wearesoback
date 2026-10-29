@@ -30,7 +30,7 @@ This is the entire product.
 1. Install
 
 ```bash
-go install github.com/realnedsanders/wasb/cmd/wasb@latest
+go install github.com/realnedsanders/wearesoback/src/cmd/wasb@latest
 ```
 
 2. Accept that you are now the person who has to explain this name in stand-up.

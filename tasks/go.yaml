@@ -60,14 +60,14 @@ tasks:
   - name: test-race
     description: Run tests with go race detector
     actions:
-      - cmd: docker run --rm -v "${PWD}:/src" -w /src --env CGO_ENABLED=1 ${GO_IMAGE} go test -tags ${GO_TAGS} -race -failfast ./...
+      - cmd: docker run --rm -v "${PWD}:/src" -w /src --env CGO_ENABLED=1 ${GO_IMAGE} go test -race -failfast ./...
         dir: src
 
   - name: build
     description: Build the container
     actions:
       - cmd: mkdir -p build
-      - cmd: docker run --rm -v "${PWD}:/project" -w /project/src -e "CGO_ENABLED=0" ${GO_IMAGE} go build -tags gms_pure_go -trimpath -ldflags="-s -w" -o /project/build/wasb ./cmd/wasb
+      - cmd: docker run --rm -v "${PWD}:/project" -w /project/src -e "CGO_ENABLED=0" ${GO_IMAGE} go build -buildvcs=false -trimpath -ldflags="-s -w" -o /project/build/wasb ./cmd/wasb
 
   - name: scan
     description: Run scanners
@@ -79,17 +79,17 @@ tasks:
   - name: govulncheck
     description: Run govulncheck in the Dockerfile Go image
     actions:
-      - cmd: docker run --rm -v "${PWD}:/src" -w /src ${GO_IMAGE} ls -lah && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - cmd: docker run --rm -v "${PWD}:/src" -w /src ${GO_IMAGE} go run golang.org/x/vuln/cmd/govulncheck@latest ./...
         dir: src
 
   - name: syft
     description: Run syft
     actions:
-      - cmd: docker run --rm -v "${PWD}:/src" -w "/src" anchore/syft:${SYFT_VERSION} . -o table -o json=${PROJECT_NAME}.sbom.json
+      - cmd: docker run --rm -v "${PWD}:/src" -w "/src" anchore/syft:${SYFT_VERSION} . -o table -o json=wasb.sbom.json
         dir: src
 
   - name: grype
     description: Run grype
     actions:
-      - cmd: docker run --rm -v "${PWD}:/src" -w "/src" anchore/grype:${GRYPE_VERSION} . -o table -o json=${PROJECT_NAME}.scan.json
+      - cmd: docker run --rm -v "${PWD}:/src" -w "/src" anchore/grype:${GRYPE_VERSION} . -o table -o json=wasb.scan.json
         dir: src
